@@ -4,25 +4,27 @@
 #
 # File: psad (/usr/sbin/psad)
 #
-# URL: http://www.cipherdyne.org/psad/
+# URL: https://www.cipherdyne.org/psad/
+#
+# Github: https://github.com/mrash/psad
 #
 # Purpose: psad makes use of iptables logs to detect port scans,
 #          probes for backdoors and DDoS tools, and other suspect traffic
 #          (many signatures were adapted from the SNORT intrusion
-#          detection system).  Data is provided by parsing syslog
+#          detection system). Data is provided by parsing syslog
 #          firewall messages out of /var/log/messages (or wherever syslog
 #          is configured to write iptables logs to).
 #
 #          For more information read the psad man page or view the
-#          documentation provided at: http://www.cipherdyne.org/psad/
+#          documentation provided at: https://www.cipherdyne.org/psad/
 #
 # Author: Michael Rash (mbr@cipherdyne.org)
 #
 # Credits: (see the CREDITS file bundled with the psad sources.)
 #
-# Version: 2.4.5
+# Version: 3.0
 #
-# Copyright (C) 1999-2017 Michael Rash (mbr@cipherdyne.org)
+# Copyright (C) 1999-2018 Michael Rash (mbr@cipherdyne.org)
 #
 # Reference: SNORT is a registered trademark of Sourcefire, Inc.
 #
@@ -30,7 +32,7 @@
 #
 #    This program is distributed in the hope that it will be useful,
 #    but WITHOUT ANY WARRANTY; without even the implied warranty of
-#    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
 #    GNU General Public License for more details.
 #
 #    You should have received a copy of the GNU General Public License
@@ -40,7 +42,7 @@
 #
 # TODO: (see the TODO file bundled with the psad sources.)
 #
-# Default behavior is as follows.  Each of these features can be disabled
+# Default behavior is as follows. Each of these features can be disabled
 # with command line arguments:
 #
 #       - passive OS fingerprinting                   = yes
@@ -53,11 +55,11 @@
 #       - parse netstat output for local server ports = yes
 #
 # Coding Style:  All configuration variables from psad.conf are stored in
-#   the %config hash by keys that are in capital letters.  This is
+#   the %config hash by keys that are in capital letters. This is
 #   the only place in the code where capital letters will be used in
-#   variables names.  There are several variables with file-scope, and
+#   variables names. There are several variables with file-scope, and
 #   these variables are clearly commented near the top of each of the
-#   psad daemons.  Lines are generally limited to 80 characters for easy
+#   psad daemons. Lines are generally limited to 80 characters for easy
 #   reading.
 #
 # Scan hash key explanation:
@@ -113,7 +115,7 @@
 # Files specification for /var/log/psad/<srcip> directories:
 #
 #   psad creates a new directory "/var/log/psad/<src>" for each new <src>
-#   from which a scan is detected.  Under this directory several files are
+#   from which a scan is detected. Under this directory several files are
 #   created:
 #
 #       danger_level       - Overall danger level aggregated for all scans.
@@ -132,12 +134,13 @@
 #
 
 ### modules used by psad
+use POSIX;
 use File::Copy;
+use File::Temp;
 use File::Path;
 use IO::Socket;
 use IO::Select;
 use Socket;
-use POSIX;
 use IO::Handle;
 use Data::Dumper;
 use Getopt::Long 'GetOptions';
@@ -146,7 +149,7 @@ use strict;
 ### ========================== main =================================
 
 ### set the current version
-my $version = '2.4.5';
+my $version = '3.0';
 
 ### default config file for psad (can be changed with
 ### --config switch)
@@ -163,8 +166,11 @@ my $debug_sid = 0;  ### debug a specific signature
 my $flush_fw = 0;
 
 ### build the iptables blocking configuration out of the
-### IPT_AUTO_CHAIN variable
+### IPT_AUTO_CHAIN variables
 my @ipt_config = ();
+
+### build the configuration for reputation feed updates
+my %reputation_data = ();
 
 ### main configuration hash
 my %config = ();
@@ -217,8 +223,8 @@ my %valid_icmp_types  = ();
 my %valid_icmp6_types = ();
 
 ### Cache snort rule messages unless --no-snort-sids switch was
-### given.  This is only useful if iptables includes rules
-### that log things like "SID123".  "fwsnort"
+### given. This is only useful if iptables includes rules
+### that log things like "SID123". "fwsnort"
 ### (http://www.cipherdyne.org/fwsnort/) will automatically
 ### build such a ruleset from snort signatures.
 my %fwsnort_sigs = ();
@@ -322,7 +328,7 @@ my $ipv4_re = qr|(?:[0-2]?\d{1,2}\.){3}[0-2]?\d{1,2}|;  ### IPv4
 my $ipv6_re = qr|(?:[a-f0-9]{4}:){7}(?:[a-f0-9]{4})|i;
 
 ### ttl values are decremented depending on the number of hops
-### the packet has taken before it hits the firewall.  We will
+### the packet has taken before it hits the firewall. We will
 ### assume packets will not jump through more than 20 hops on
 ### average.
 my $max_hops = 20;
@@ -425,6 +431,8 @@ my $print_ver        = 0;
 my $help             = 0;
 my $dump_conf        = 0;
 my $download_sigs    = 0;
+my $reputation_feeds_update = 0;
+my $reputation_feeds_list = 0;
 my $chk_interval     = 0;
 my $log_len          = 23;  ### used in scan_logr()
 my $fw_analyze       = 0;
@@ -434,7 +442,7 @@ my $rm_data_ctr      = 0;
 my $analysis_emails  = 0;
 my $analysis_whois   = 0;
 my $enable_analysis_dns = 0;
-my $netstat_lkup_ctr = 0;
+my $port_lkup_ctr    = 0;
 my $kmsgsd_started   = 0;
 my $warn_msg         = '';
 my $die_msg          = '';
@@ -457,17 +465,18 @@ my $no_snort_sids = 0;
 my $no_signatures = 0;
 my $no_icmp_types = 0;
 my $no_icmp6_types = 0;
+my $no_port_lookup = 0;
 my $no_auto_dl    = 0;
 my $no_posf       = 0;
 my $no_daemon     = 0;
 my $no_ipt_errors = 0;
 my $no_rdns       = 0;
 my $no_whois      = 0;
-my $no_netstat    = 0;
 my $no_fwcheck    = 0;
 my $no_kmsgsd     = 0;
 my $no_email_alerts  = 0;
 my $no_syslog_alerts = 0;
+my $no_reputation_feeds = 0;
 
 ### tcp option types
 my $tcp_nop_type       = 1;
@@ -669,7 +678,7 @@ my @args_cp = @ARGV;
 &get_local_ips();
 
 ### get the current services running on this machine
-&get_listening_ports() unless $no_netstat;
+&get_listening_ports() unless $no_port_lookup;
 
 ### daemonize psad unless running with --no-daemon or an
 ### analysis mode
@@ -691,8 +700,8 @@ unless ($no_daemon or $debug) {
 ### SYSLOG_DAEMON is set to ulogd or psad is configured to acquire data
 ### from a normal file via IPT_SYSLOG_FILE), so let's start it here for good
 ### measure (as of 0.9.2 it makes use of the pid files and unique_pid(),
-### so we don't have to worry about starting a duplicate copy).  While
-### we're at it, start psadwatchd as well.  Note that this is the best
+### so we don't have to worry about starting a duplicate copy). While
+### we're at it, start psadwatchd as well. Note that this is the best
 ### place to start the other daemons since we just wrote the psad pid
 ### to PID_FILE above.
 my $cmd = '';
@@ -734,9 +743,9 @@ if ($config{'ENABLE_AUTO_IDS'} eq 'Y') {
     &flush_auto_blocked_ips() if $config{'FLUSH_IPT_AT_INIT'} eq 'Y';
 
     ### Check to see if psad automatically blocked some IPs from
-    ### a previous run.  This feature is most useful for preserving
+    ### a previous run. This feature is most useful for preserving
     ### auto-block rules for IPs after a reboot or after restarting
-    ### psad.  (Note that ENABLE_AUTO_IDS is disabled by psad_init()
+    ### psad. (Note that ENABLE_AUTO_IDS is disabled by psad_init()
     ### if we are running on a syslog server or if we are running
     ### in -A mode).
     &renew_auto_blocked_ips();
@@ -976,14 +985,14 @@ sub check_scan() {
         $year     = This_Year();
     }
 
-    unless ($no_netstat) {
+    unless ($no_port_lookup) {
         ### we don't expect the list of ports the machine is listening
         ### on to change very often.
-        if ($netstat_lkup_ctr == 10) {
+        if ($port_lkup_ctr == 10) {
             &get_listening_ports();
-            $netstat_lkup_ctr = 0;
+            $port_lkup_ctr = 0;
         }
-        $netstat_lkup_ctr++;
+        $port_lkup_ctr++;
     }
     ### the local machine ip addresses could change (dhcp, etc.)
     ### but not that often.
@@ -1006,7 +1015,6 @@ sub check_scan() {
 
     ### loop through all of the packet log messages we have just acquired
     ### from iptables
-
     PKT: for my $pkt_str (@$fw_packets_ar) {
 
         ### main packet data structure
@@ -1114,9 +1122,10 @@ sub check_scan() {
         }
 
         ### see if we need to assign a danger level according to the auto_dl
-        ### file.  The return value is the auto-assigned danger level (or
+        ### file. The return value is the auto-assigned danger level (or
         ### -1 if there is no auto-assigned danger level.
         unless ($no_auto_dl) {
+
             my $rv = &assign_auto_danger_level(\%pkt);
 
             print STDERR "[+] assign_auto_danger_level() returned: $rv\n"
@@ -1128,10 +1137,24 @@ sub check_scan() {
             }
         }
 
+        ### reputation feed comparisons may influence danger level
+        if ($config{'ENABLE_REPUTATION_FEEDS'} eq 'Y') {
+
+            my $rv = &reputation_feeds_check(\%pkt);
+
+            print STDERR "[+] reputation_feeds_check() returned: $rv\n"
+                if $debug;
+            if ($rv == 0) {
+                print STDERR "[+] ignoring $pkt{'src'} $pkt{'proto'} ",
+                    "$pkt{'dp'} scan.\n" if $debug;
+                next PKT;
+            }
+        }
+
         if ($pkt{'proto'} eq 'icmp') {
 
             ### validate icmp type and code fields against the official values
-            ### in RFC 792.  See %inval_type_code for corresponding signature
+            ### in RFC 792. See %inval_type_code for corresponding signature
             ### message text and danger levels.
             my $type_code_rv = &check_icmp_type(
                     'icmp', \%valid_icmp_types,
@@ -1168,7 +1191,7 @@ sub check_scan() {
         } elsif ($pkt{'proto'} eq 'icmp6') {
 
             ### validate icmp6 type and code fields against the official values
-            ### defined by IANA.  See %inval_type_code for corresponding signature
+            ### defined by IANA. See %inval_type_code for corresponding signature
             ### message text and danger levels.
             my $type_code_rv = &check_icmp_type(
                     'icmp6', \%valid_icmp6_types,
@@ -1341,7 +1364,7 @@ sub check_scan() {
             unless (defined $scan{$pkt{'src'}}{$pkt{'dst'}}{$pkt{'proto'}}
                     and defined $scan{$pkt{'src'}}{$pkt{'dst'}}{$pkt{'proto'}}{'abs_sp'}) {
                 ### This is the absolute starting port since the
-                ### first packet was detected.  Make sure the initial
+                ### first packet was detected. Make sure the initial
                 ### start port is not too low
                 $scan{$pkt{'src'}}{$pkt{'dst'}}{$pkt{'proto'}}{'abs_sp'} = 65535;
                 ### make sure the initial end port is not too high
@@ -1372,7 +1395,7 @@ sub check_scan() {
         ### system based on the ttl, id, len, window, and tos
         ### fields in tcp syn packets (this technique is based
         ### on the paper "Passive OS Fingerprinting: Details
-        ### and Techniques" by Toby Miller).  Also attempt to
+        ### and Techniques" by Toby Miller). Also attempt to
         ### fingerprint with a re-implementation of Michal Zalewski's
         ### p0f that only requires iptables log messages
         unless ($no_posf) {
@@ -1469,7 +1492,7 @@ sub parse_NF_pkt_str() {
     $pkt_hr->{'raw'} = $pkt_str if $csv_mode or $gnuplot_mode;
 
     ### see if there is a logging prefix (used for scan email alert even
-    ### if we are running with FW_SEARCH_ALL = Y).  Note that sometimes
+    ### if we are running with FW_SEARCH_ALL = Y). Note that sometimes
     ### there is a buffering issue in the kernel ring buffer that is used
     ### to hold the iptables log message, so we want to get only the
     ### very last possible candidate for the log prefix (this is why the
@@ -1700,9 +1723,9 @@ sub parse_NF_pkt_str() {
                     $pkt_hr->{'win'}, $pkt_hr->{'flags'})
                         = ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10);
 
-                $pkt_hr->{'s_obj'} = new6 NetAddr::IP($pkt_hr->{'src'})
+                $pkt_hr->{'s_obj'} = NetAddr::IP->new6($pkt_hr->{'src'})
                     or return $PKT_ERROR;
-                $pkt_hr->{'d_obj'} = new6 NetAddr::IP($pkt_hr->{'dst'})
+                $pkt_hr->{'d_obj'} = NetAddr::IP->new6($pkt_hr->{'dst'})
                     or return $PKT_ERROR;
 
                 if ($pkt_str =~ /(?:OPT\s+\(\s+\)\s+){7,}/) {
@@ -1735,9 +1758,9 @@ sub parse_NF_pkt_str() {
                     $pkt_hr->{'flags'})
                         = ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10);
 
-                $pkt_hr->{'s_obj'} = new NetAddr::IP($pkt_hr->{'src'})
+                $pkt_hr->{'s_obj'} = NetAddr::IP->new($pkt_hr->{'src'})
                     or return $PKT_ERROR;
-                $pkt_hr->{'d_obj'} = new NetAddr::IP($pkt_hr->{'dst'})
+                $pkt_hr->{'d_obj'} = NetAddr::IP->new($pkt_hr->{'dst'})
                     or return $PKT_ERROR;
 
             } else {
@@ -1765,7 +1788,7 @@ sub parse_NF_pkt_str() {
             ### FIXME: ignore TCP packets that have the ACK or RST
             ### bits set (unless we matched a snort sid) since
             ### _usually_ we see these packets as a result of the
-            ### iptables connection tracking bug.  Also, note that
+            ### iptables connection tracking bug. Also, note that
             ### no signatures make use of the RST flag.
 
             print STDERR "[-] err packet: matched ACK or RST flag.\n"
@@ -1852,9 +1875,9 @@ sub parse_NF_pkt_str() {
                     $pkt_hr->{'flow_label'}, $pkt_hr->{'sp'}, $pkt_hr->{'dp'},
                     $pkt_hr->{'udp_len'}) = ($1,$2,$3,$4,$5,$6,$7,$8,$9);
 
-                $pkt_hr->{'s_obj'} = new6 NetAddr::IP($pkt_hr->{'src'})
+                $pkt_hr->{'s_obj'} = NetAddr::IP->new6($pkt_hr->{'src'})
                     or return $PKT_ERROR;
-                $pkt_hr->{'d_obj'} = new6 NetAddr::IP($pkt_hr->{'dst'})
+                $pkt_hr->{'d_obj'} = NetAddr::IP->new6($pkt_hr->{'dst'})
                     or return $PKT_ERROR;
 
             } else {
@@ -1879,9 +1902,9 @@ sub parse_NF_pkt_str() {
                     $pkt_hr->{'sp'}, $pkt_hr->{'dp'}, $pkt_hr->{'udp_len'})
                         = ($1,$2,$3,$4,$5,$6,$7,$8,$9);
 
-                $pkt_hr->{'s_obj'} = new NetAddr::IP($pkt_hr->{'src'})
+                $pkt_hr->{'s_obj'} = NetAddr::IP->new($pkt_hr->{'src'})
                     or return $PKT_ERROR;
-                $pkt_hr->{'d_obj'} = new NetAddr::IP($pkt_hr->{'dst'})
+                $pkt_hr->{'d_obj'} = NetAddr::IP->new($pkt_hr->{'dst'})
                     or return $PKT_ERROR;
 
             } else {
@@ -1925,9 +1948,9 @@ sub parse_NF_pkt_str() {
                     $pkt_hr->{'flow_label'}, $pkt_hr->{'itype'},
                     $pkt_hr->{'icode'}) = ($1,$2,$3,$4,$5,$6,$7,$8);
 
-                $pkt_hr->{'s_obj'} = new6 NetAddr::IP($pkt_hr->{'src'})
+                $pkt_hr->{'s_obj'} = NetAddr::IP->new6($pkt_hr->{'src'})
                     or return $PKT_ERROR;
-                $pkt_hr->{'d_obj'} = new6 NetAddr::IP($pkt_hr->{'dst'})
+                $pkt_hr->{'d_obj'} = NetAddr::IP->new6($pkt_hr->{'dst'})
                     or return $PKT_ERROR;
 
             } else {
@@ -1952,9 +1975,9 @@ sub parse_NF_pkt_str() {
                     $pkt_hr->{'ttl'}, $pkt_hr->{'ip_id'}, $pkt_hr->{'itype'},
                     $pkt_hr->{'icode'}) = ($1,$2,$3,$4,$5,$6,$7);
 
-                $pkt_hr->{'s_obj'} = new NetAddr::IP($pkt_hr->{'src'})
+                $pkt_hr->{'s_obj'} = NetAddr::IP->new($pkt_hr->{'src'})
                     or return $PKT_ERROR;
-                $pkt_hr->{'d_obj'} = new NetAddr::IP($pkt_hr->{'dst'})
+                $pkt_hr->{'d_obj'} = NetAddr::IP->new($pkt_hr->{'dst'})
                     or return $PKT_ERROR;
 
             } else {
@@ -1990,7 +2013,22 @@ sub parse_NF_pkt_str() {
 
         if ($is_ipv6) {
 
-            ### FIXME future
+            if ($pkt_str =~ /SRC=($ipv6_re)\s+DST=($ipv6_re)\s+/) {
+
+                ($pkt_hr->{'src'}, $pkt_hr->{'dst'}) = ($1,$2);
+
+                $pkt_hr->{'s_obj'} = NetAddr::IP->new6($pkt_hr->{'src'})
+                    or return $PKT_ERROR;
+                $pkt_hr->{'d_obj'} = NetAddr::IP->new6($pkt_hr->{'dst'})
+                    or return $PKT_ERROR;
+
+                $pkt_hr->{'proto'} = $proto_num;
+
+            } else {
+                print STDERR "[-] err packet: strange IPv6 format\n"
+                    if $debug;
+                return $PKT_ERROR;
+            }
 
         } else {
 
@@ -2004,19 +2042,33 @@ sub parse_NF_pkt_str() {
                 ($pkt_hr->{'src'}, $pkt_hr->{'dst'}, $pkt_hr->{'ip_len'},
                     $pkt_hr->{'ttl'}, $pkt_hr->{'ip_id'}) = ($1,$2,$3,$4,$5);
 
-                $pkt_hr->{'s_obj'} = new NetAddr::IP($pkt_hr->{'src'})
+                $pkt_hr->{'s_obj'} = NetAddr::IP->new($pkt_hr->{'src'})
                     or return $PKT_ERROR;
-                $pkt_hr->{'d_obj'} = new NetAddr::IP($pkt_hr->{'dst'})
+                $pkt_hr->{'d_obj'} = NetAddr::IP->new($pkt_hr->{'dst'})
                     or return $PKT_ERROR;
-            }
 
-            $pkt_hr->{'proto'} = $proto_num;
+                $pkt_hr->{'proto'} = $proto_num;
+
+            } else {
+                print STDERR "[-] err packet: strange IPv4 format\n"
+                    if $debug;
+                return $PKT_ERROR;
+            }
         }
 
     } else {
         ### Sometimes the iptables log entry gets messed up due to
         ### buffering issues so we write it to the error log.
         print STDERR "[-] err packet: no regex match.\n" if $debug;
+        return $PKT_ERROR;
+    }
+
+    unless ($pkt_hr->{'s_obj'}) {
+        print STDERR "[-] No s_obj object\n" if $debug;
+        return $PKT_ERROR;
+    }
+    unless ($pkt_hr->{'d_obj'}) {
+        print STDERR "[-] No d_obj object\n" if $debug;
         return $PKT_ERROR;
     }
 
@@ -2634,7 +2686,7 @@ sub p0f_ipv4() {
     #
     # wwww:ttt:D:ss:OOO...:OS:Version:Subtype:Details
     #
-    # wwww     - window size (can be *, %nnn, Snn or Tnn).  The special values
+    # wwww     - window size (can be *, %nnn, Snn or Tnn). The special values
     #            "S" and "T" which are a multiple of MSS or a multiple of MTU
     #            respectively.
     # ttt      - initial TTL
@@ -2715,7 +2767,7 @@ sub p0f_ipv4() {
                             {$test_frag_bit}{$sig_ttl}{$sig_win_size}}) {
                         my @sig_opts = split /\,/, $sig_opts;
                         for (my $i=0; $i<=$#sig_opts; $i++) {
-                            ### tcp option order is important.  Check to see if
+                            ### tcp option order is important. Check to see if
                             ### the option order in the packet matches the order we
                             ### expect to see in the signature
                             if ($sig_opts[$i] =~ /^([NMWST])/) {
@@ -3117,7 +3169,7 @@ sub delete_old_scans() {
 }
 
 sub dshield_email_log() {
-    ### dshield alert interval is in hours.  Check to see if there are more
+    ### dshield alert interval is in hours. Check to see if there are more
     ### than 10,000 lines of log data (and if the last alert was sent more than
     ### two hours later than the previous alert), and if yes send the alert
     ### email.
@@ -3247,6 +3299,12 @@ sub import_perl_modules() {
     Unix::Syslog->import(qw(:subs :macros));
     Storable->import(qw(retrieve store)) if $store_file;
 
+    if ($debug) {
+        print STDERR "[+] IPTables::ChainMgr::VERSION: $IPTables::ChainMgr::VERSION\n";
+        require IPTables::Parse; ### debug mode only, IPTables::ChainMgr imports it
+        print STDERR "[+] IPTables::Parse::VERSION $IPTables::Parse::VERSION\n";
+    }
+
     $imported_syslog_module = 1;
 
     return;
@@ -3345,8 +3403,9 @@ sub psad_init() {
 
     ### check to make sure the commands specified in the config section
     ### are in the right place, and attempt to correct automatically if not.
-    ### (wget is only needed in --sig-update mode)
-    my %cmd_exceptions = ('wget' => '');
+    ### (wget is only needed in --sig-update mode). Also, 'ss' is used by
+    ### default instead of netstat.
+    my %cmd_exceptions = ('wget'=>'', 'netstat'=>'');
     $cmd_exceptions{'ifconfig'} = '' if $config{'IFCFGTYPE'} =~ /iproute2/i;
     &check_commands(\%cmd_exceptions);
 
@@ -3367,12 +3426,16 @@ sub psad_init() {
 
     ### download latest signatures from
     ### http://www.cipherdyne.org/psad/signatures
-    exit &download_signatures() if $download_sigs;
+    if ($download_sigs or $reputation_feeds_update) {
+        &download_signatures() if $download_sigs;
+        &download_reputation_feeds() if $reputation_feeds_update;
+        exit $EXIT_SUCCESS; ### die calls made in previous functions
+    }
 
     ### set some config variables based on command line input
     &handle_cmdline();
 
-    $ipt_opts{'tmpdir'}     = $config{'PSAD_DIR'};
+    $ipt_opts{'tmpdir'}     = $config{'PSAD_TMP_DIR'};
     $ipt_opts{'iptout_pat'} = $config{'IPT_OUTPUT_PATTERN'};
     $ipt_opts{'ipterr_pat'} = $config{'IPT_ERROR_PATTERN'};
 
@@ -3416,6 +3479,12 @@ sub psad_init() {
     ### were added by the psad project).
     &import_signatures() unless $no_signatures;
 
+    ### import reputation feed data
+    unless ($no_reputation_feeds) {
+        &import_reputation_feeds();
+        exit $EXIT_SUCCESS if $reputation_feeds_list;
+    }
+
     ### there is a set of ports that should be ignored
     &parse_ignore_ports();
 
@@ -3454,7 +3523,7 @@ sub psad_init() {
     &dump_conf() if $debug;
 
     if ($restrict_ip_cmdline) {
-        $restrict_ip = new NetAddr::IP $restrict_ip_cmdline
+        $restrict_ip = NetAddr::IP->new($restrict_ip_cmdline)
             or die "[*] Could not acquire NetAddr::IP object for $restrict_ip";
     }
 
@@ -3751,9 +3820,9 @@ sub get_connected_subnets() {
             next if $intf_name eq 'lo';
             next if $intf_name =~ /dummy/i;
             if ($line =~ /^\s+inet.*?($ipv4_re)\/(\d+)/i) {
-                push @connected_subnets, new NetAddr::IP($1, $2);
+                push @connected_subnets, NetAddr::IP->new($1, $2);
             } elsif ($line =~ /inet6\s(\S+)/) {
-                push @connected_subnets, new6 NetAddr::IP($1);
+                push @connected_subnets, NetAddr::IP->new6($1);
             }
         }
     } else {
@@ -3768,9 +3837,9 @@ sub get_connected_subnets() {
             next if $intf_name eq 'lo';
             next if $intf_name =~ /dummy/i;
             if ($line =~ /^\s+inet.*?:($ipv4_re).*:($ipv4_re)/i) {
-                push @connected_subnets, new NetAddr::IP($1, $2);
+                push @connected_subnets, NetAddr::IP->new($1, $2);
             } elsif ($line =~ /^\s+inet6\saddr:\s+(\S+)/) {
-                push @connected_subnets, new6 NetAddr::IP($1);
+                push @connected_subnets, NetAddr::IP->new6($1);
             }
         }
     }
@@ -3812,15 +3881,15 @@ sub validate_home_net() {
         for my $net (@home_nets) {
             my $home_net = '';
             if ($net =~ m|($ipv4_re/$ipv4_re)|) {
-                $home_net = new NetAddr::IP $1;
+                $home_net = NetAddr::IP->new($1);
             } elsif ($net =~ m|($ipv4_re/\d+)|) {
-                $home_net = new NetAddr::IP $1;
+                $home_net = NetAddr::IP->new($1);
             } elsif ($net =~ m|($ipv4_re)|) {
-                $home_net = new NetAddr::IP $1;
+                $home_net = NetAddr::IP->new($1);
             } else {
                 next;
             }
-            push @local_nets, new NetAddr::IP $net;
+            push @local_nets, NetAddr::IP->new($net);
             my $found = 0;
             for my $net (@$connected_subnets_ar) {
                 $found = $found_one_net = 1
@@ -4023,6 +4092,192 @@ sub parse_ignore_interfaces() {
     return;
 }
 
+sub import_reputation_feeds() {
+
+    ### now import the data from the filesystem for each feed
+    RFEED: for my $feed (@{$config{'REPUTATION_FEED'}}) {
+
+        my $msg = "importing reputation feed: '$feed->{'feed_name'}'";
+        if ($reputation_feeds_list) {
+            print "[+] $msg\n";
+        } else {
+            &sys_log($msg);
+        }
+
+        ### check for the feed data file
+        my $feed_data_file = "$config{'REPUTATION_FEEDS_DIR'}/$feed->{'local_file'}";
+
+        unless (-e $feed_data_file) {
+            my $msg = "reputation feed '$feed->{'feed_name'}' data " .
+                "file: '$feed_data_file' does not exist.";
+            if ($reputation_feeds_list) {
+                print "[-] $msg\n";
+            } else {
+                &sys_log($msg);
+            }
+            next RFEED;
+        }
+
+        my %new_feed_data = ('ipv4'=>{}, 'ipv6'=>{});
+
+        open F, "< $feed_data_file" or die "[*] Could not open: $feed_data_file: $!";
+        if ($feed->{'data_format'} eq 'newline') {
+            while (<F>) {
+                if ($feed->{'data_type'} eq 'IP') {
+                    if (/($ipv4_re)/) {
+                        $new_feed_data{'ipv4'}{$1} = '';
+                    } elsif (/($ipv6_re)/) {
+                        $new_feed_data{'ipv6'}{$1} = '';
+                    }
+                }
+            }
+        }
+        close F;
+
+        $msg = "feed '$feed->{'feed_name'}', imported " . (keys (%{$new_feed_data{'ipv4'}})) .
+            " IPv4 addresses, and " . (keys (%{$new_feed_data{'ipv6'}})) . " IPv6 addresses";
+        if ($reputation_feeds_list) {
+            print "[+] $msg\n";
+        } else {
+            &sys_log($msg);
+        }
+
+        unless ($reputation_feeds_list) {
+            &reputation_feeds_report_diffs($feed, \%new_feed_data)
+                if $feed->{'enable_diffs'};
+
+            if ($feed->{'data_type'} eq 'IP') {
+
+                for my $ip_type (qw(ipv4 ipv6)) {
+
+                    ### zero out the old reputation feed data
+                    $reputation_data{$feed->{'feed_name'}}{$ip_type} = {};
+
+                    ### copy the newly imported feed data into place
+                    for my $ip (keys %{$new_feed_data{$ip_type}}) {
+                        $reputation_data{$feed->{'feed_name'}}{$ip_type}{$ip} = '';
+                    }
+                }
+            }
+        }
+    }
+
+    return;
+}
+
+sub reputation_feeds_report_diffs() {
+    my ($feed, $new_feed_data) = @_;
+
+    unless (defined $reputation_data{$feed->{'feed_name'}}) {
+        &sys_log("reputation feed: '$feed->{'feed_name'}' is new");
+        return;
+    }
+
+    my $diff_email_file = "$config{'PSAD_DIR'}/reputation_feed_diff";
+    my $time = scalar localtime();
+    my $is_diff = 0;
+    my $new_ipv4_ctr = 0;
+    my $new_ipv6_ctr = 0;
+    my $deleted_ipv4_ctr = 0;
+    my $deleted_ipv6_ctr = 0;
+
+    ### email file handle
+    my $fh;
+
+    ### open the email alert file
+    if ($no_daemon) {
+        $fh = *STDOUT;
+    } else {
+        open E, "> $diff_email_file" or
+            die "[*] Could not open $diff_email_file: $!";
+        $fh = *E;
+    }
+
+    print $fh "=-=-=-=-=-=-=-=-=-=-=-= $time =-=-=-=-=-=-=-=",
+        "-=-=-=-=\n\n\n";
+
+    if ($feed->{'data_type'} eq 'IP') {
+        print $fh "Reputation feed: '$feed->{'feed_name'}' IP updates:\n";
+        for my $ip_type ('ipv4', 'ipv6') {
+            ### look for removed IP's
+            for my $ip (keys %{$reputation_data{$feed->{'feed_name'}}{'ipv4'}}) {
+                unless (defined $new_feed_data->{$ip_type}) {
+                    print $fh "- Deleted IP: $ip\n";
+                    $is_diff = 1;
+                    if ($ip_type eq 'ipv4') {
+                        $deleted_ipv4_ctr += 1;
+                    } else {
+                        $deleted_ipv6_ctr += 1;
+                    }
+                }
+            }
+            for my $ip (keys %{$new_feed_data->{$ip_type}}) {
+                unless (defined $reputation_data{$feed->{'feed_name'}}{$ip_type}) {
+                    print $fh "+ New IP: $ip\n";
+                    $is_diff = 1;
+                    if ($ip_type eq 'ipv4') {
+                        $new_ipv4_ctr += 1;
+                    } else {
+                        $new_ipv6_ctr += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    print $fh "\n=-=-=-=-=-=-=-=-=-=-=-= $time =-=-=-=-=-=-=-=",
+        "-=-=-=-=\n";
+    close $fh unless $no_daemon;
+
+    if ($is_diff and not $no_daemon) {
+        &sys_log("reputation feed: '$feed->{'feed_name'}' IPv4 new/deleted addrs: " .
+            "$new_ipv4_ctr/$deleted_ipv4_ctr, IPv6 new/deleted addrs: " .
+            "$new_ipv6_ctr/$deleted_ipv6_ctr");
+        &send_mail("$config{'MAIL_STATUS_PREFIX'} Reputation diff: $feed->{'feed_name'}",
+            $diff_email_file, $config{'EMAIL_ADDRESSES'}, $cmds{'mail'});
+    }
+    return;
+}
+
+sub reputation_feed_parse_conf_var() {
+    my $reputation_var_str = shift;
+
+    ### <feed name>,<danger level>,<data type>,<data format>,<update interval>,<enable diffs>,<local file>,<update CMD>
+    ### "EmergingThreats Block IPs",4,IP,newline,1440,Y,ET-Block-IPs,"/usr/bin/curl -o $FILE https://rules.emergingthreats.net/fwrules/emerging-Block-IPs.txt";
+    my ($feed_name, $danger_level, $data_type, $data_format, $update_interval,
+        $enable_diffs, $local_file, $update_cmd) = split /,/, $reputation_var_str;
+
+    $feed_name  =~ s/\"//g;
+    $feed_name  =~ s/\'//g;
+    $update_cmd =~ s/\"//g;
+    $update_cmd =~ s/\'//g;
+
+    die "[*] REPUTATION_FEED danger level: '$danger_level' must be in the range [1-5]."
+        unless $danger_level =~ m|^\d+$| and $danger_level >= 1 and $danger_level <= 5;
+    die "[*] REPUTATION_FEED data type: '$data_type' not supported, must be 'IP' for now."
+        unless $data_type eq 'IP';
+    die "[*] REPUTATION_FEED data format: '$data_format' not supported, must be 'newline' for now."
+        unless $data_format eq 'newline';
+    die "[*] REPUTATION_FEED update interval: '$update_interval' must be in the range [0-43200]."
+        unless $update_interval =~ m|^\d+$| and $update_interval >= 0 and $update_interval <= 43200;
+    die "[*] REPUTATION_FEED enable diffs: '$enable_diffs' not supported, must be 'Y' or 'N'."
+        unless $enable_diffs eq 'Y' or $enable_diffs eq 'N';
+
+    ### expand any existing $LOCAL_FILE variable in the update command
+#    $update_cmd =~ s/\$LOCAL_FILE/$local_file/;
+
+    return {
+        'raw_str'         => $reputation_var_str,
+        'feed_name'       => $feed_name,
+        'data_type'       => $data_type,
+        'data_format'     => $data_format,
+        'update_interval' => $update_interval,
+        'enable_diffs'    => $enable_diffs,
+        'local_file'      => $local_file,
+        'update_cmd'      => $update_cmd
+    }
+}
+
 sub import_snort_rules() {
 
     %fwsnort_sigs = ();
@@ -4067,6 +4322,12 @@ sub import_snort_rules() {
                     $fwsnort_sigs{$sid}{'classtype'} = $1;
                 } else {
                     $fwsnort_sigs{$sid}{'classtype'} = '';
+                }
+
+                if (/[\s;]metadata:\s*(.*?)\s*;/) {
+                    $fwsnort_sigs{$sid}{'metadata'} = [split '\s*,\s*', $1];
+                } else {
+                    $fwsnort_sigs{$sid}{'metadata'} = '';
                 }
 
                 $fwsnort_sigs{$sid}{'priority'} = &convert_snort_priority($1)
@@ -4122,9 +4383,9 @@ sub import_snort_class_priorities() {
         ### config classification: rpc-portmap-decode,Decode of an RPC Query,2
         if (/config\s+classification:\s+(\S+),.*(\d+)/) {
             ### the snort priority value can go from 1 to 10, with 1 being the
-            ### worst offense and 10 being the least.  Most priorities are
-            ### from 1 to 4.  We need to map these into the psad danger levels
-            ### (reversed).  NOTE: the Snort engine does not enforce the 1-10
+            ### worst offense and 10 being the least. Most priorities are
+            ### from 1 to 4. We need to map these into the psad danger levels
+            ### (reversed). NOTE: the Snort engine does not enforce the 1-10
             ### range.
             $snort_class_dl{$1} = &convert_snort_priority($2);
         }
@@ -4649,10 +4910,10 @@ sub expand_sig_ips() {
                     or $ip =~ m|($ipv4_re/\d+)|
                     or $ip =~ m|($ipv4_re)|) {
                 push @arr, $1;
-                $sig_ip_objs{$1} = new NetAddr::IP($1);
+                $sig_ip_objs{$1} = NetAddr::IP->new($1);
             } elsif ($ip =~ m|\:|) {
                 push @arr, $ip;
-                $sig_ip_objs{$ip} = new NetAddr::IP($ip)
+                $sig_ip_objs{$ip} = NetAddr::IP->new($ip)
                     or die "[*] NetAddr::IP error for $ip";
             }
         }
@@ -4661,13 +4922,13 @@ sub expand_sig_ips() {
             or $ip_str =~ m|($ipv4_re/\d+)|
             or $ip_str =~ m|($ipv4_re)|) {
         push @arr, $1;
-        $sig_ip_objs{$1} = new NetAddr::IP($1)
+        $sig_ip_objs{$1} = NetAddr::IP->new($1)
             or die "[*] NetAddr::IP error for $1";
 
     } elsif ($ip_str =~ m|\:|) {
 
         push @arr, $ip_str;
-        $sig_ip_objs{$ip_str} = new NetAddr::IP($ip_str)
+        $sig_ip_objs{$ip_str} = NetAddr::IP->new($ip_str)
             or die "[*] NetAddr::IP error for $ip_str";
 
     } elsif ($ip_str eq 'any' or $ip_str =~ m|NOT_?USED|i) {
@@ -4676,7 +4937,7 @@ sub expand_sig_ips() {
 
         ### this will match any IPv4 or IPv6 address
         $sig_ip_objs{'any'}
-            = new6 NetAddr::IP('0000:0000:0000:0000:0000:0000:0000:0000/0');
+            = NetAddr::IP->new6('0000:0000:0000:0000:0000:0000:0000:0000/0');
 
     } else {
         die "[*] import_signatures(): Unrecognized src/dst: $ip_str ",
@@ -4808,7 +5069,7 @@ sub import_auto_dl() {
             next;
         }
 
-        $auto_dl_ip_objs{$ip} = new NetAddr::IP($ip, $mask);
+        $auto_dl_ip_objs{$ip} = NetAddr::IP->new($ip, $mask);
         unless (defined $auto_dl_ip_objs{$ip} and $auto_dl_ip_objs{$ip}) {
             &sys_log("auto_dl could not acquire NetAddr::IP object at line $i");
             next;
@@ -4849,7 +5110,6 @@ sub import_auto_dl() {
     close F;
 
     if (%auto_dl) {
-
         ### don't write syslog message if we are running in --fw-block-ip
         ### mode
         unless ($fw_block_ip) {
@@ -5129,6 +5389,41 @@ sub assign_danger_level() {
             "$scan_dl{$src}\n" if $debug;
     }
     return;
+}
+
+sub reputation_feeds_check() {
+    my $pkt_hr = shift;
+
+    my $rv = -1;
+
+    for my $feed (@{$config{'REPUTATION_FEED'}}) {
+        next unless $feed->{'data_type'} eq 'IP';
+
+        my $feed_dl = $feed->{'danger_level'};
+        my $do_update_dl = 0; 
+        my $src = $pkt_hr->{'src'};
+        if ($pkt_hr->{'is_ipv6'}) {
+            if (defined $reputation_data{$feed->{'feed_name'}}{'ipv6'}{$src}) {
+                if ($scan_dl{$src} < $feed_dl) {
+                    $do_update_dl = 1;
+                }
+            }
+        } else {
+            if (defined $reputation_data{$feed->{'feed_name'}}{'ipv4'}{$src}) {
+                if ($scan_dl{$src} < $feed_dl) {
+                    $do_update_dl = 1;
+                }
+            }
+        }
+
+        if ($do_update_dl) {
+            &sys_log("reputation feed: '$feed->{'feed_name'}' " .
+                "assigned DL: $feed_dl for IP: $src");
+            $scan_dl{$src} = $feed_dl;
+            $rv = $feed_dl;
+        }
+    }
+    return $rv;
 }
 
 sub assign_auto_danger_level() {
@@ -5626,8 +5921,8 @@ sub scan_logr() {
                 ### we're most likely interested in the whois information for
                 ### a non local IP address
                 if ($config{'ENABLE_WHOIS_FORCE_SRC_IP'} eq 'N'
-                        and &is_local($src, new NetAddr::IP($src))
-                        and not &is_local($dst, new NetAddr::IP($dst))) {
+                        and &is_local($src, NetAddr::IP->new($src))
+                        and not &is_local($dst, NetAddr::IP->new($dst))) {
                     $whois_which_ip_str = 'destination IP';
                     $lookup_ip = $dst;
                 }
@@ -6146,6 +6441,13 @@ sub scan_logr_signatures() {
                         }
                     }
                 }
+
+                ### Snort metadata
+                if ($sig_hr->{'metadata'}) {
+                    for my $metadata_field (@{$sig_hr->{'metadata'}}) {
+                        print $email_fh "       $metadata_field\n";
+                    }
+                }
                 print $email_fh "\n";
             }
         }
@@ -6439,7 +6741,7 @@ sub sockwrite_flush_auto_rules() {
 
 sub flush_auto_blocked_ips() {
 
-    my $ipt = new IPTables::ChainMgr(%ipt_opts)
+    my $ipt = IPTables::ChainMgr->new(%ipt_opts)
         or die '[*] Could not acquire IPTables::ChainMgr object.';
 
     &sys_log('flushing existing psad iptables ' .
@@ -6530,7 +6832,7 @@ sub get_auto_response_domain_sock() {
 sub check_auto_response_sock() {
 
     ### we expect that the AUTO_IPT_SOCK file should exist
-    ### in the filesystem.  If not, then something deleted it
+    ### in the filesystem. If not, then something deleted it
     ### and we can recover by reopening it.
     return if -e $config{'AUTO_IPT_SOCK'};
 
@@ -6558,7 +6860,7 @@ sub ipt_block() {
 
     print STDERR "[+] ipt_block($ip)\n" if $debug;
 
-    my $ipt = new IPTables::ChainMgr(%ipt_opts)
+    my $ipt = IPTables::ChainMgr->new(%ipt_opts)
         or die '[*] Could not acquire IPTables::ChainMgr object.';
 
     my $block_success   = 0;
@@ -6680,7 +6982,7 @@ sub ipt_block() {
 
         ### make sure the ip is in the auto_blocked_ips cache (the ip
         ### may have come from the command line with --fw-block-ip
-        ### instead of through the iptables log).  Also, don't re-define
+        ### instead of through the iptables log). Also, don't re-define
         ### the block time if it has already been defined (note that we
         ### may instantiated multiple block actions in the for loop
         ### above).
@@ -6734,7 +7036,7 @@ sub ipt_block() {
 sub ipt_rm_block() {
     my $ip = shift;
 
-    my $ipt = new IPTables::ChainMgr(%ipt_opts)
+    my $ipt = IPTables::ChainMgr->new(%ipt_opts)
         or die '[*] Could not acquire IPTables::ChainMgr object.';
 
     print STDERR "[+] ipt_rm_block($ip)\n" if $debug;
@@ -6821,7 +7123,7 @@ sub ipt_rm_block() {
 
 sub ipt_list_auto_chains() {
 
-    my $ipt = new IPTables::ChainMgr(%ipt_opts)
+    my $ipt = IPTables::ChainMgr->new(%ipt_opts)
         or die '[*] Could not acquire IPTables::ChainMgr object.';
 
     print "[+] Listing chains from IPT_AUTO_CHAIN keywords...\n";
@@ -6903,15 +7205,15 @@ sub sockwrite_add_ipt_block_ip() {
     if ($fw_block_ip =~ m|^\s*($ipv4_re)\s*$|) {
         $block_ip   = $1;
         $block_mask = '32';
-        $block_net = new NetAddr::IP($1);
+        $block_net = NetAddr::IP->new($1);
     } elsif ($fw_block_ip =~ m|^\s*($ipv4_re)/($ipv4_re)\s*$|) {
         $block_ip   = $1;
         $block_mask = $2;
-        $block_net = new NetAddr::IP($1, $2);
+        $block_net = NetAddr::IP->new($1, $2);
     } elsif ($fw_block_ip =~ m|^\s*($ipv4_re)/(\d+)\s*$|) {
         $block_ip   = $1;
         $block_mask = $2;
-        $block_net = new NetAddr::IP($1, $2);
+        $block_net = NetAddr::IP->new($1, $2);
     } else {
         die "[*] Badly formatted block IP: $fw_block_ip";
     }
@@ -6975,15 +7277,15 @@ sub sockwrite_rm_ipt_block_ip() {
     if ($fw_rm_block_ip =~ m|^\s*($ipv4_re)\s*$|) {
         $rm_block_ip   = $1;
         $rm_block_mask = '32';
-        $rm_block_net = new NetAddr::IP($1);
+        $rm_block_net = NetAddr::IP->new($1);
     } elsif ($fw_rm_block_ip =~ m|^\s*($ipv4_re)/($ipv4_re)\s*$|) {
         $rm_block_ip   = $1;
         $rm_block_mask = $2;
-        $rm_block_net = new NetAddr::IP($1, $2);
+        $rm_block_net = NetAddr::IP->new($1, $2);
     } elsif ($fw_rm_block_ip =~ m|^\s*($ipv4_re)/(\d+)\s*$|) {
         $rm_block_ip   = $1;
         $rm_block_mask = $2;
-        $rm_block_net = new NetAddr::IP($1, $2);
+        $rm_block_net = NetAddr::IP->new($1, $2);
     } else {
         die "[*] Badly formatted rm block IP: $fw_rm_block_ip";
     }
@@ -7108,7 +7410,7 @@ sub auto_psad_response() {
 
         my $dl = $scan_dl{$src};
 
-        ### We only want to block the IP once.  Currently this will block
+        ### We only want to block the IP once. Currently this will block
         ### all traffic from the host to _all_ destinations that are
         ### protected by the firewall if the IP trips the $auto_psad_level
         ### threshold for _any_ destination.
@@ -7232,7 +7534,7 @@ sub build_ipt_config() {
 
     &make_psad_dirs() unless -d $config{'PSAD_DIR'};
 
-    my $ipt = new IPTables::ChainMgr(%ipt_opts)
+    my $ipt = IPTables::ChainMgr->new(%ipt_opts)
         or die '[*] Could not acquire IPTables::ChainMgr object.';
 
     my $ctr = 1;
@@ -7459,14 +7761,48 @@ sub get_local_ips() {
 
 sub get_listening_ports() {
     %local_ports = ();
-    my @lines = @{&run_command($cmds{'netstat'}, '-an 2> /dev/null')};
-    return unless @lines;
-    for my $line (@lines) {
-        next unless $line;
-        chomp $line;
-        if ($line =~ m/^\s*(tcp|udp)\s+\d+\s+\d+\s+\S+:(\d+)\s/) {
-            ### $1 == protocol (tcp/udp), $2 == port number
-            $local_ports{$1}{$2} = '';
+
+    if (defined $cmds{'ss'} and -x $cmds{'ss'}) {
+        ### UDP first
+        ### UNCONN     0      0            *:5353            *:*
+        my @lines = @{&run_command($cmds{'ss'}, '-l -u -n 2> /dev/null')};
+        return unless @lines;
+        for my $line (@lines) {
+            next unless $line;
+            chomp $line;
+            if ($line =~ m/UNCONN\s+\S+\s+\S+\s+\S+\:(\d+)/) {
+                $local_ports{'udp'}{$1} = '';
+            }
+        }
+
+        ### now TCP
+        ### LISTEN     0      128          *:22              *:*
+        @lines = @{&run_command($cmds{'ss'}, '-l -t -n 2> /dev/null')};
+        return unless @lines;
+        for my $line (@lines) {
+            next unless $line;
+            chomp $line;
+            if ($line =~ m/LISTEN\s+\S+\s+\S+\s+\S+\:(\d+)/) {
+                $local_ports{'tcp'}{$1} = '';
+            }
+        }
+
+    } else {
+        my @lines = @{&run_command($cmds{'netstat'}, '-an 2> /dev/null')};
+        return unless @lines;
+        for my $line (@lines) {
+            next unless $line;
+            chomp $line;
+            if ($line =~ m/^\s*(tcp|udp)\s+\d+\s+\d+\s+\S+:(\d+)/) {
+                my $proto = $1;
+                my $port  = $2;
+                if ($proto eq 'tcp') {
+                    if ($line !~ /LISTEN/) {
+                        next;
+                    }
+                }
+                $local_ports{$1}{$2} = '';
+            }
         }
     }
     return;
@@ -7531,7 +7867,7 @@ sub get_whois_info() {
         };
 
         if ($@) {
-            system "$cmds{'killall'} $cmds{'whois'}";
+            system "$cmds{'pkill'} $cmds{'whois'}";
             kill 9, $pid unless kill 15, $pid;
             print STDERR "[-] whois alarm on pid: $pid\n" if $debug;
             warn $@;
@@ -7658,10 +7994,10 @@ sub analysis_mode() {
 
     my $fh = '';
     if ($pkts_from_stdin) {
-        print "[+] Entering analysis mode.  Parsing STDIN\n";
+        print "[+] Entering analysis mode. Parsing STDIN\n";
         $fh = *STDIN;
     } else {
-        print "[+] Entering analysis mode.  Parsing $fw_data_file\n";
+        print "[+] Entering analysis mode. Parsing $fw_data_file\n";
         open MSGS, "< $fw_data_file" or die "[*] Could not open ",
             "$fw_data_file: $!";
         $fh = *MSGS;
@@ -8671,25 +9007,25 @@ sub csv_tokens() {
                     $search_hsh{'str'} = $1;
                 } elsif ($search =~ m|^$ipv4_re/$ipv4_re$|) {
                     $search_hsh{'net'} = $search;
-                    $search_hsh{'net_obj'} = new NetAddr::IP($search)
+                    $search_hsh{'net_obj'} = NetAddr::IP->new($search)
                         or die "[*] NetAddr::IP($search) error";
                 } elsif ($search =~ m|^$ipv4_re/\d+$|) {
                     $search_hsh{'net'} = $search;
-                    $search_hsh{'net_obj'} = new NetAddr::IP($search)
+                    $search_hsh{'net_obj'} = NetAddr::IP->new($search)
                         or die "[*] NetAddr::IP($search) error";
                 } elsif ($search =~ m|^$ipv4_re$|) {
                     $search_hsh{'ip'} = $search;
-                    $search_hsh{'ip_obj'} = new NetAddr::IP($search)
+                    $search_hsh{'ip_obj'} = NetAddr::IP->new($search)
                         or die "[*] NetAddr::IP($search) error";
                 } elsif ($search =~ m|\:|) {
                     ### see if this is an IPv6 address
                     if ($search =~ m|\/|) {
                         $search_hsh{'net'} = $search;
-                        $search_hsh{'net_obj'} = new6 NetAddr::IP($search)
+                        $search_hsh{'net_obj'} = NetAddr::IP->new6($search)
                             or die "[*] NetAddr::IP($search) error";
                     } else {
                         $search_hsh{'net'} = $search;
-                        $search_hsh{'net_obj'} = new6 NetAddr::IP($search)
+                        $search_hsh{'net_obj'} = NetAddr::IP->new6($search)
                             or die "[*] NetAddr::IP($search) error";
                     }
                 } else {
@@ -8795,7 +9131,7 @@ sub fw_analyze_mode() {
         $run_fw_check = 1;
     } else {
         ### if psad is running on a syslog server, do not check the firewall
-        ### rules since they may not be local.  Also, do not check the
+        ### rules since they may not be local. Also, do not check the
         ### firewall if psad is configured to parse all iptables messages.
         unless ($no_fwcheck or $syslog_server
                 or $config{'ENABLE_FW_LOGGING_CHECK'} eq 'N') {
@@ -8994,7 +9330,7 @@ sub print_scan_status() {
                 ", Pkts: $tot_pkts, Total protocols: $tot_protocols, " .
                 "Unique sigs: $uniq_sigs";
 
-            my $src_obj = new NetAddr::IP($src) or die "[*] NetAddr::IP($src) error";
+            my $src_obj = NetAddr::IP->new($src) or die "[*] NetAddr::IP($src) error";
             if ($src_obj->version() == 6) {
                 $src_str = "\nSRC:  $src (" . $src_obj->short() .
                     "), DL: $dl, Dsts: $total_dsts" .
@@ -9032,7 +9368,7 @@ sub print_scan_status() {
 
             DST: for my $dst (keys %{$scan{$src}}) {
                 my $dst_str = "    DST: $dst";
-                my $dst_obj = new NetAddr::IP($dst)
+                my $dst_obj = NetAddr::IP->new($dst)
                     or die "[*] NetAddr::IP($dst) error";
                 if ($dst_obj->version() == 6) {
                     $dst_str = "    DST: $dst (" . $dst_obj->short() . ')';
@@ -9203,7 +9539,7 @@ sub print_blocked_ip_status() {
         push @print_lines,  "    iptables auto-blocked IPs:\n";
     }
 
-    my $ipt = new IPTables::ChainMgr(%ipt_opts)
+    my $ipt = IPTables::ChainMgr->new(%ipt_opts)
         or die '[*] Could not acquire IPTables::ChainMgr object.';
 
     my $found_line = 0;
@@ -9791,7 +10127,7 @@ sub print_top_attackers() {
             next unless defined $top_packet_counts{$src}
                     or defined $top_sig_counts{$src};
 
-            my $ip_obj = new NetAddr::IP($src)
+            my $ip_obj = NetAddr::IP->new($src)
                 or die "[*] NetAddr::IP $src error";
 
             $ip_objs{$src} = $ip_obj;
@@ -10310,7 +10646,7 @@ sub setup() {
                 close SYSLOG;
                 &sys_log('reconfiguring syslogd to write ' .
                     "kern.info messages to $config{'PSAD_FIFO_FILE'}");
-                system "$cmds{'killall'} -HUP syslogd";
+                system "$cmds{'pkill'} --signal HUP syslogd";
             }
         } else {
             &send_mail("$config{'MAIL_ERROR_PREFIX'} " .
@@ -10355,7 +10691,7 @@ sub setup() {
 
                 &sys_log('reconfiguring syslog-ng to write ' .
                     "kern.info messages to $config{'PSAD_FIFO_FILE'}");
-                system "$cmds{'killall'} -HUP syslog-ng";
+                system "$cmds{'pkill'} --signal HUP syslog-ng";
             }
         } else {
             &send_mail("$config{'MAIL_ERROR_PREFIX'} " .
@@ -10524,7 +10860,7 @@ sub disk_space_exceeded() {
         }
         if ($rm_data_ctr > $config{'DISK_MAX_RM_RETRIES'}) {
             &sys_log("could not sufficiently reduce disk " .
-                "utilization in $config{'PSAD_DIR'} partition.  " .
+                "utilization in $config{'PSAD_DIR'} partition. " .
                 "Stopping psad!");
             &send_mail("$config{'MAIL_ERROR_PREFIX'} Could not " .
                 "reduce disk utilization on " .
@@ -10777,28 +11113,114 @@ sub run_command() {
     return \@lines;
 }
 
+sub download_reputation_feeds() {
+
+    my $curr_pwd = getcwd();
+
+    chdir $config{'PSAD_TMP_DIR'} or die $!;
+
+    print getcwd(), "\n";
+
+    my $msg = 'updating reputation feed data';
+    if ($reputation_feeds_update) {
+        print "[+] $msg\n";
+    } else {
+        &sys_log($msg);
+    }
+
+    RFEED: for my $feed (@{$config{'REPUTATION_FEED'}}) {
+
+        my $msg = "downloading reputation feed data for: '$feed->{'feed_name'}'";
+        if ($reputation_feeds_update) {
+            print "[+] $msg\n";
+        } else {
+            &sys_log($msg);
+        }
+
+        my $feed_full_path = "$config{'REPUTATION_FEEDS_DIR'}/$feed->{'local_file'}";
+
+        &archive_conf($feed_full_path);
+
+        my $download_file = mktemp($feed->{'local_file'} . '.XXXXXX');
+        my $download_cmd  = $feed->{'update_cmd'};
+
+        if ($download_cmd =~ m|\$LOCAL_FILE|) {
+            $download_cmd =~ s|\$LOCAL_FILE|$download_file|;
+        } else {
+            $download_file = $feed->{'local_file'};
+        }
+
+        if ($download_cmd =~ m|^(/\S+)\s+(.*)|) {
+            my $cmd  = $1;
+            #my $args = "$2 2> /dev/null";
+            my $args = $2;
+            &run_command($cmd, $args);
+        } else {
+            system $download_cmd;
+        }
+
+        unless (-e $download_file) {
+            ### skip this one since we couldn't download it
+            my $msg = "could not download/acquire feed " .
+                "data for: '$feed->{'feed_name'}'";
+            if ($reputation_feeds_update) {
+                print "[+] $msg\n";
+            } else {
+                &sys_log($msg);
+            }
+            next RFEED;
+        }
+
+        unlink $feed_full_path if -e $feed_full_path;
+        move $download_file, $feed_full_path;
+
+        if (-e $feed_full_path) {
+            my $msg = "successfully updated feed " .
+                "data for: '$feed->{'feed_name'}'";
+            if ($reputation_feeds_update) {
+                print "[+] $msg\n";
+            } else {
+                &sys_log($msg);
+            }
+        } else {
+            my $msg = "could not download/acquire feed " .
+                "data for: '$feed->{'feed_name'}'";
+            if ($reputation_feeds_update) {
+                print "[+] $msg\n";
+            } else {
+                &sys_log($msg);
+            }
+        }
+    }
+
+    chdir $curr_pwd or die $!;
+
+    return;
+}
+
 sub download_signatures() {
 
     &archive_conf($config{'SIGS_FILE'});
 
     ### for wget
-    &check_commands({'sendmail'=>'', 'mail'=>''});
+    &check_commands({'sendmail'=>'', 'mail'=>'', 'netstat'=>''});
 
     my $curr_pwd = getcwd();
-    chdir '/tmp' or die $!;
+
+    chdir $config{'PSAD_TMP_DIR'} or die $!;
 
     print "[+] Downloading latest signatures from:\n",
         "        $config{'SIG_UPDATE_URL'}\n";
 
-    unlink 'signatures' if -e 'signatures';
+    my $download_file = mktemp('signatures.XXXXXX');
 
     ### download the file
-    system "$cmds{'wget'} $config{'SIG_UPDATE_URL'}";
+    system "$cmds{'wget'} -O $download_file $config{'SIG_UPDATE_URL'}";
 
-    die "[*] Could not download signature file" unless -e 'signatures';
+    die "[*] Could not download signature file" unless -e $download_file;
 
     unlink $config{'SIGS_FILE'} if -e $config{'SIGS_FILE'};
-    move 'signatures', $config{'SIGS_FILE'};
+    move $download_file, $config{'SIGS_FILE'};
 
     print
 "[+] New signature file $config{'SIGS_FILE'} has been put in\n",
@@ -10807,7 +11229,7 @@ sub download_signatures() {
 
     chdir $curr_pwd or die $!;
 
-    return $EXIT_SUCCESS;
+    return;
 }
 
 sub date_time() {
@@ -10842,7 +11264,21 @@ sub archive_conf() {
     my $file = shift;
 
     my $curr_pwd = getcwd();
-    chdir $config{'CONF_ARCHIVE_DIR'} or die $!;
+
+    chdir $config{'CONF_ARCHIVE_DIR'} or die "[*] Could not " .
+        "chdir($config{'CONF_ARCHIVE_DIR'}): $!";
+
+    unless (-e $file) {
+        my $msg = "archive_conf(): file '$file' does not exist.";
+        if ($download_sigs or $reputation_feeds_update) {
+            print "[-] $msg\n";
+        } else {
+            &sys_log($msg);
+        }
+        chdir $curr_pwd or die $!;
+        return;
+    }
+
     my ($filename) = ($file =~ m|.*/(.*)|);
     my $base = "${filename}.old";
     for (my $i = 5; $i > 1; $i--) {  ### keep five copies of old config files
@@ -10853,10 +11289,15 @@ sub archive_conf() {
                 "move ${base}${j}.gz -> ${base}${i}.gz: $!";
         }
     }
-    print "[+] Archiving original $file -> ${base}1\n";
+    my $msg = "Archiving original $file -> ${base}1";
+    if ($download_sigs or $reputation_feeds_update) {
+        print "[+] $msg\n";
+    } else {
+        &sys_log($msg);
+    }
 
     unlink "${base}1.gz" if -e "${base}1.gz";
-    ### move $file into the archive directory
+    ### copy $file into the archive directory
     copy $file, "${base}1" or die "[*] Could not copy ",
         "$file -> ${base}1: $!";
 
@@ -10881,22 +11322,26 @@ sub import_config() {
 
     open C, "< $conf_file" or die "[*] Could not open " .
         "config file $conf_file: $!";
-    my @lines = <C>;
-    close C;
-    for my $line (@lines) {
+    for my $line (<C>) {
         chomp $line;
         next if ($line =~ /^\s*#/);
         if ($line =~ /^\s*(\S+)\s+(.*?)\;/) {
             my $varname = $1;
             my $val     = $2;
-            if ($val =~ m|/.+| && $varname =~ /^\s*(\S+)Cmd$/) {
+            if ($val =~ m|/.+| and $varname =~ /^\s*(\S+)Cmd$/) {
                 ### found a command
                 $cmds{$1} = $val unless defined $cmds{$1};
             } else {
-                $config{$varname} = $val unless defined $config{$varname};
+                ### handle variables that can be set multiple times
+                if ($varname eq 'REPUTATION_FEED') {
+                    push @{$config{$varname}}, &reputation_feed_parse_conf_var($val);
+                } else {
+                    $config{$varname} = $val unless defined $config{$varname};
+                }
             }
         }
     }
+    close C;
     return;
 }
 
@@ -11049,6 +11494,20 @@ sub check_commands() {
         }
     }
 
+    ### if 'ss' is not available make sure netstat is there as a fall back
+    unless (defined $cmds{'ss'} and -x $cmds{'ss'}) {
+        if (defined $cmds{'netstat'}) {
+            unless (-x $cmds{'netstat'}) {
+                $no_port_lookup = 1;
+                warn "[*] Neither 'ss' nor 'netstat' commands are available, ",
+                    "setting --no-port-lookup.";
+            }
+        } else {
+            $no_port_lookup = 1;
+            warn "[*] Neither 'ss' nor 'netstat' commands are available, ",
+                "setting --no-port-lookup.";
+        }
+    }
     return;
 }
 
@@ -11118,8 +11577,13 @@ sub send_mail() {
         close F;
     }
 
-    open MAIL, qq{| $mailCmd -s "$subject" $addr_str > /dev/null 2>&1} or die
-        qq{[*] Could not send mail: $mailCmd -s "$subject" $addr_str: $!};
+    my $mail_str = $mailCmd;
+    $mail_str .= " $config{'EMAIL_APPEND_HEADER'}"
+        if $config{'EMAIL_APPEND_HEADER'} ne 'NONE';
+    $mail_str .= qq{ -s "$subject" $addr_str > /dev/null 2>&1};
+
+    open MAIL, qq{| $mail_str} or die
+        qq{[*] Could not send mail: $mail_str: $!};
     if ($body_file and @mail_body_lines) {
         print MAIL for @mail_body_lines;
     }
@@ -11145,6 +11609,9 @@ sub getopt_wrapper() {
         'signatures=s'      => \$sigs_file,       # Path to psad signatures file.
         'sig-update'        => \$download_sigs,   # Download the latest signatures from
                                                   # http://www.cipherdyne.org/psad/signatures
+        'reputation-feeds-update' => \$reputation_feeds_update,  # Download the latest reputation
+                                                  # feeds data.
+        'reputation-feeds-list' => \$reputation_feeds_list, # List all reputation feeds.
         'passive-os-sigs=s' => \$posf_file,       # Path to passive os fingerprinting
                                                   #   signatures.
         'snort-type=s'      => \$srules_type,     # Only process snort rules of
@@ -11239,7 +11706,7 @@ sub getopt_wrapper() {
                                                   #   psad in auto blocking code.
         'List'              => \$fw_list_auto,    # Synonym for --fw-list-auto
         'fw-block-ip=s'     => \$fw_block_ip,     # Add an IP/net to the psad auto-
-                                                  #   blocking chains.  Then psad can
+                                                  #   blocking chains. Then psad can
                                                   #   manage timeouts, etc.
         'fw-rm-block-ip=s'  => \$fw_rm_block_ip,  # Delete any block rule against an IP
         'fw-del-chains'     => \$fw_del_chains,   # Delete psad chains in addition to
@@ -11278,6 +11745,7 @@ sub getopt_wrapper() {
         'lib-dir=s'         => \$lib_dir,         # Specify path to psad lib directory.
         'no-snort-sids'     => \$no_snort_sids,   # Disable search for snort SID's
                                                   #   in iptables messages.
+        'no-reputation-feeds' => \$no_reputation_feeds, # Disable reputation feed matching.
         'no-whois'          => \$no_whois,        # Do not issue whois lookups against
         'no-passiveos'      => \$no_posf,         # Do not attempt to passively
         'no-passive-os'     => \$no_posf,         # Do not attempt to passively
@@ -11291,7 +11759,7 @@ sub getopt_wrapper() {
         'no-fwcheck'        => \$no_fwcheck,      # Do not check firewall rules.
         'no-rdns'           => \$no_rdns,         # Do not issue dns lookups against
                                                   #   scanning IP address.
-        'no-netstat'        => \$no_netstat,      # Do not check to see if the
+        'no-port-lookup'    => \$no_port_lookup,  # Do not check to see if the
                                                   #   firewall is listening on
                                                   #   localport that has been scanned.
         'no-ipt-errors'     => \$no_ipt_errors,   # Do not write malformed packet.
@@ -11372,6 +11840,8 @@ sub required_vars() {
         ENABLE_WHOIS_LOOKUPS PSAD_FW_READ_PID_FILE DL1_UNIQUE_HOSTS
         DL2_UNIQUE_HOSTS DL3_UNIQUE_HOSTS DL4_UNIQUE_HOSTS DL5_UNIQUE_HOSTS
         PORT_RANGE_SWEEP_THRESHOLD ENABLE_OVERRIDE_FW_CMD FW_CMD FW_CMD_ARGS
+        EMAIL_APPEND_HEADER ENABLE_REPUTATION_FEEDS REPUTATION_FEED
+        REPUTATION_FEEDS_DIR PSAD_TMP_DIR
     ));
     &defined_vars(\@required_vars);
     return;
@@ -11404,6 +11874,10 @@ Options:
     --sig-update                  - Download the latest set of psad
                                     signatures from:
                                     http://www.cipherdyne.org/
+    --reputation-feeds-update     - Download the latest reputation feed data.
+                                    Use --reputation-list to list all
+                                    configured reputation feeds.
+    --reputation-feeds-list       - List all configured reputation feeds.
     -w,  --whois-analysis         - Enable whois lookups when running in
                                     offline --Analyze-msgs mode.
     --dns-analysis                - Enable reverse DNS lookups in
@@ -11540,6 +12014,7 @@ Options:
     --no-snort-sids               - Disable examination for snort sids
                                     (such as those generated by fwsnort) in
                                     iptables log messages.
+    --no-reputation-feeds         - Disable reputation feed comparisons.
     --no-signatures               - Disable psad signature processing
                                     (independent of snort sid matching).
     --no-icmp-types               - Disable icmp type/code validation.
@@ -11553,8 +12028,9 @@ Options:
     --no-kmsgsd                   - Disable startup of kmsgsd (useful for
                                     debugging with an existing file of
                                     iptables log messages).
-    --no-netstat                  - Disable local port lookups for scan
+    --no-port-lookup              - Disable local port lookups for scan
                                     signatures.
+    --no-netstat                  - Synonym for --no-port-lookup.
     -h   --help                   - Display usage on STDOUT and exit.
 
 _HELP_

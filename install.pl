@@ -4,20 +4,20 @@
 #
 # File: install.pl
 #
-# Purpose:  install.pl is the installation script for psad.  It is safe
+# Purpose:  install.pl is the installation script for psad. It is safe
 #           to execute install.pl even if psad has already been installed
 #           on a system since install.pl will preserve the existing
 #           config section.
 #
 # Credits:  (see the CREDITS file)
 #
-# Copyright (C) 1999-2017 Michael Rash (mbr@cipherdyne.org)
+# Copyright (C) 1999-2018 Michael Rash (mbr@cipherdyne.org)
 #
 # License (GNU Public License):
 #
 #    This program is distributed in the hope that it will be useful,
 #    but WITHOUT ANY WARRANTY; without even the implied warranty of
-#    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
 #    GNU General Public License for more details.
 #
 #    You should have received a copy of the GNU General Public License
@@ -74,6 +74,7 @@ my %file_vars = (
 
 my %exclude_cmds = (
     'wget'         => '',
+    'netstat'      => '',
     'mail'         => '',
     'sendmail'     => '',
     'uname'        => '',
@@ -162,7 +163,6 @@ my $noarchive   = 0;
 my $uninstall   = 0;
 my $help        = 0;
 my $archived_old = 0;
-my $skip_syslog_test = 0;
 my $use_answers = 0;
 my $no_write_answers = 0;
 my %answers = ();
@@ -201,7 +201,6 @@ Getopt::Long::Configure('no_ignore_case');
     'no-rm-lib-dir'     => \$no_rm_old_lib_dir, ### remove any old /usr/lib/psad dir
     'no-preserve'       => \$noarchive,   ### Don't preserve existing configs.
     'syslog-conf=s'     => \$syslog_conf, ### specify path to syslog config file.
-    'no-syslog-test'    => \$skip_syslog_test,
     'uninstall'         => \$uninstall,   ### Uninstall psad.
     'init-dir=s'        => \$init_dir,
     'systemd-init-dir=s' => \$systemd_init_dir,
@@ -315,7 +314,7 @@ sub install() {
     ### make sure install.pl is being called from the source directory
     unless (-e 'psad') {
         die "[*] install.pl can only be executed from the directory\n",
-            "    that contains the psad sources!  Exiting.";
+            "    that contains the psad sources! Exiting.";
     }
     &logr('[+] ' . localtime() . " Installing psad on hostname: $HOSTNAME\n");
 
@@ -381,6 +380,10 @@ sub install() {
         &logr("[+] Creating $config{'PSAD_DIR'}\n");
         &full_mkdir($config{'PSAD_DIR'}, 0700);
     }
+    unless (-d $config{'PSAD_TMP_DIR'}) {
+        &logr("[+] Creating $config{'PSAD_TMP_DIR'}\n");
+        &full_mkdir($config{'PSAD_TMP_DIR'}, 0700);
+    }
     unless (-d $config{'PSAD_LIBS_DIR'}) {
         &logr("[+] Creating $config{'PSAD_LIBS_DIR'}\n");
         &full_mkdir($config{'PSAD_LIBS_DIR'}, 0755);
@@ -425,7 +428,8 @@ sub install() {
         }
     }
 
-    if (-d 'deps' and -d 'deps/snort_rules') {
+    my $snort_dir = 'deps/snort_rules';
+    if (-d 'deps' and -d $snort_dir) {
 
         &logr("[+] Installing Snort-2.3.3 signatures in " .
             "$config{'SNORT_RULES_DIR'}\n");
@@ -433,21 +437,47 @@ sub install() {
             &full_mkdir($config{'SNORT_RULES_DIR'}, 0700);
         }
 
-        opendir D, 'deps/snort_rules' or die "[*] Could not open ",
-            "the deps/snort_rules directory: $!";
+        opendir D, $snort_dir or die "[*] Could not open ",
+            "the $snort_dir/ directory: $!";
         my @files = readdir D;
         closedir D;
 
         for my $file (@files) {
             next unless $file =~ /\.rules$/ or $file =~ /\.config$/;
-            &logr("[+] Installing deps/snort_rules/${file}\n");
-            copy "deps/snort_rules/${file}",
+            &logr("[+] Installing ${snort_dir}/${file}\n");
+            copy "${snort_dir}/${file}",
                  "$config{'SNORT_RULES_DIR'}/${file}" or
-                die "[*] Could not copy deps/snort_rules/${file} -> ",
+                die "[*] Could not copy ${snort_dir}/${file} -> ",
                     "$config{'SNORT_RULES_DIR'}/${file}: $!";
             &perms_ownership("$config{'SNORT_RULES_DIR'}/${file}", 0600);
         }
     }
+
+    ### reputation feed data
+    my $repu_dir = 'deps/reputation_feeds';
+    if (-d 'deps' and -d $repu_dir) {
+
+        &logr("[+] Installing reputation feed data in " .
+            "$config{'REPUTATION_FEEDS_DIR'}\n");
+        unless (-d $config{'REPUTATION_FEEDS_DIR'}) {
+            &full_mkdir($config{'REPUTATION_FEEDS_DIR'}, 0700);
+        }
+
+        opendir D, $repu_dir or die "[*] Could not open ",
+            "the $repu_dir directory: $!";
+        my @files = readdir D;
+        closedir D;
+        for my $file (@files) {
+            next if $file eq '.' or $file eq '..';
+            &logr("[+] Installing ${repu_dir}/${file}\n");
+            copy "${repu_dir}/${file}",
+                 "$config{'REPUTATION_FEEDS_DIR'}/${file}" or
+                die "[*] Could not copy ${repu_dir}/${file} -> ",
+                    "$config{'REPUTATION_FEEDS_DIR'}/${file}: $!";
+            &perms_ownership("$config{'REPUTATION_FEEDS_DIR'}/${file}", 0600);
+        }
+    }
+
     print "\n\n";
 
     &logr("[+] Compiling kmsgsd, and psadwatchd:\n");
@@ -467,16 +497,16 @@ sub install() {
     print "\n\n";
     &logr("[+] Verifying compilation of fwcheck_psad.pl script:\n");
     unless (&run_cmd("$cmds{'perl'} -c fwcheck_psad.pl") == 0) {
-        die "[*] fwcheck_psad.pl does not compile with \"perl -c\".  Download ",
+        die "[*] fwcheck_psad.pl does not compile with \"perl -c\". Download ",
             "the latest sources from:\n\nhttp://www.cipherdyne.org/"
             unless $skip_module_install;
     }
 
-    ### make sure the psad (perl) daemon compiles.  The other three
+    ### make sure the psad (perl) daemon compiles. The other three
     ### daemons have all been re-written in C.
     &logr("[+] Verifying compilation of psad perl daemon:\n");
     unless (&run_cmd("$cmds{'perl'} -c psad") == 0) {
-        die "[*] psad does not compile with \"perl -c\".  Download the",
+        die "[*] psad does not compile with \"perl -c\". Download the",
             " latest sources from:\n\nhttp://www.cipherdyne.org/"
             unless $skip_module_install;
     }
@@ -484,7 +514,7 @@ sub install() {
     ### install nf2csv
     &logr("[+] Verifying compilation of nf2csv script:\n");
     unless (&run_cmd("$cmds{'perl'} -c nf2csv") == 0) {
-        die "[*] nf2csv does not compile with \"perl -c\".  Download ",
+        die "[*] nf2csv does not compile with \"perl -c\". Download ",
             "the latest sources from:\n\nhttp://www.cipherdyne.org/"
             unless $skip_module_install;
     }
@@ -610,7 +640,7 @@ sub install() {
         }
 
         ### Give the admin the opportunity to set the strings that are
-        ### parsed out of iptables messages.  This is useful since the
+        ### parsed out of iptables messages. This is useful since the
         ### admin may have configured the firewall to use a logging prefix
         ### of "Audit" or something else other than the default string
         ### "DROP".
@@ -667,7 +697,7 @@ sub install() {
             if ($syslog_str eq 'syslogd') {
                 if (-e $syslog_conf) {
                     &append_fifo_syslog($syslog_conf);
-                    if (&run_cmd("$cmds{'killall'} -HUP syslogd 2> /dev/null") == 0) {
+                    if (&run_cmd("$cmds{'pkill'} --signal HUP syslogd 2> /dev/null") == 0) {
                         &logr("[+] HUP signal sent to syslogd.\n");
                         $restarted_syslog = 1;
                     }
@@ -675,7 +705,7 @@ sub install() {
             } elsif ($syslog_str eq 'rsyslogd') {
                 if (-e $syslog_conf) {
                     &append_fifo_syslog($syslog_conf);
-                    if (&run_cmd("$cmds{'killall'} -HUP rsyslogd 2> /dev/null") == 0) {
+                    if (&run_cmd("$cmds{'pkill'} --signal HUP rsyslogd 2> /dev/null") == 0) {
                         &logr("[+] HUP signal sent to rsyslogd.\n");
                         $restarted_syslog = 1;
                     }
@@ -684,7 +714,7 @@ sub install() {
             } elsif ($syslog_str eq 'syslog-ng') {
                 if (-e $syslog_conf) {
                     &append_fifo_syslog_ng($syslog_conf);
-                    if (&run_cmd("$cmds{'killall'} -HUP syslog-ng 2> /dev/null") == 0) {
+                    if (&run_cmd("$cmds{'pkill'} --signal HUP syslog-ng 2> /dev/null") == 0) {
                         &logr("[+] HUP signal sent to syslog-ng.\n");
                         $restarted_syslog = 1;
                     }
@@ -692,7 +722,7 @@ sub install() {
             } elsif ($syslog_str eq 'metalog') {
                 if (-e $syslog_conf) {
                     &config_metalog($syslog_conf);
-                    &logr("[-] Metalog support is shaky in psad.  " .
+                    &logr("[-] Metalog support is shaky in psad. " .
                         "Use at your own risk.\n");
                     ### don't send warning about not restarting metalog daemon
                     $restarted_syslog = 1;
@@ -703,60 +733,10 @@ sub install() {
                 &logr("[-] Could not restart any syslog daemons.\n");
             }
         }
-
-        if (-x $cmds{'iptables'} and not $skip_syslog_test) {
-            &logr("[+] Found iptables. Testing syslog configuration:\n");
-            ### make sure we actually see packets being logged by
-            ### the firewall.
-            if ($syslog_str ne 'ulogd') {
-                if (&test_syslog_config($syslog_str)) {
-                    &logr("[+] Successful $syslog_str reconfiguration.\n\n");
-                } else {
-                    if (&query_init_script_restart_syslog()) {
-
-                        my $restarted = 0;
-                        if ($syslog_str eq 'syslog-ng') {
-                            if (-e "$init_dir/syslog-ng") {
-                                &run_cmd("$init_dir/syslog-ng restart");
-                                $restarted = 1;
-                            }
-                        } elsif ($syslog_str eq 'rsyslogd') {
-                            if (-e "$init_dir/sysklogd") {
-                                &run_cmd("$init_dir/sysklogd restart");
-                                $restarted = 1;
-                            } elsif (-e "$init_dir/syslog") {
-                                &run_cmd("$init_dir/syslog restart");
-                                $restarted = 1;
-                            }
-                        } else {
-                            if (-e "$init_dir/rsyslog") {
-                                &run_cmd("$init_dir/rsyslog restart");
-                                $restarted = 1;
-                            }
-                        }
-                        ### test syslog config again now that we
-                        ### have restarted syslog via the init script
-                        ### instead of relying on a HUP signal to
-                        ### syslog
-                        if ($restarted) {
-                            if (&test_syslog_config($syslog_str)) {
-                                &logr("[+] Successful $syslog_str reconfiguration.\n\n");
-                            } else {
-                                &logr("[-] Unsuccessful $syslog_str reconfiguration.\n");
-                                &logr("    Consult the psad man page for the basic " .
-                                    "$syslog_str requirement to get psad to work.\n\n");
-                            }
-                        }
-                    } else {
-                        &logr("[-] Ok, hoping that psad can get packet data anyway.\n");
-                    }
-                }
-            }
-        }
     }
 
     ### download signatures?
-    &download_signatures() if &query_signatures();
+    &run_cmd("${USRSBIN_DIR}/psad --sig-update") if &query_signatures();
 
     &install_manpage('psad.8');
     &install_manpage('psadwatchd.8');
@@ -861,6 +841,8 @@ sub import_config() {
 
     &required_vars();
 
+    $exclude_cmds{'ifconfig'} = '' if $config{'IFCFGTYPE'} =~ /iproute2/i;
+
     return;
 }
 
@@ -877,6 +859,7 @@ sub expand_vars() {
         }
         for my $hr (\%config, \%cmds) {
             for my $var (keys %$hr) {
+                next if $var eq 'REPUTATION_FEED';
                 my $val = $hr->{$var};
                 if ($val =~ m|\$(\w+)|) {
                     my $sub_var = $1;
@@ -926,7 +909,7 @@ sub uninstall() {
         exit 0;
     }
     ### after this point, psad will really be uninstalled so stop writing stuff
-    ### to the install.log file.  Just print everything to STDOUT
+    ### to the install.log file. Just print everything to STDOUT
     if (-e $config{'PSAD_PID_FILE'}) {
         open PID, "$config{'PSAD_PID_FILE'}" or die "[*] Could not open ",
             "$config{'PSAD_PID_FILE'}: $!";
@@ -1154,6 +1137,26 @@ sub run_cmd() {
     return (system $cmd) >> 8;
 }
 
+sub get_netaddr() {
+    my ($ip, $mask) = @_;
+
+    my @ipbytes = split /\./, $ip;
+    my @mbytes  = split /\./, $mask;
+
+    my $netaddr = '';
+    for (my $i=0; $i < 4; $i++) {
+        my $byte1 = $mbytes[$i]+0;
+        my $byte2 = $ipbytes[$i]+0;
+        my $netaddr_byte = $byte1 & $byte2;
+        if ($i != 0) {
+            $netaddr = $netaddr . '.' . $netaddr_byte;
+        } else {
+            $netaddr = $netaddr_byte;
+        }
+    }
+    return $netaddr;
+}
+
 sub set_home_net() {
     my $file = shift;
 
@@ -1175,46 +1178,53 @@ sub set_home_net() {
 
     ### get all interfaces; even those that are down since they may
     ### brought up any time.
-    my @ifconfig_out = `$cmds{'ifconfig'} -a`;
     my $home_net_str = '';
     my $intf_name = '';
     my $net_ctr = 0;
     my %connected_subnets;
-    for my $line (@ifconfig_out) {
-        if ($line =~ /^\s*lo\s+Link/) {
-            $intf_name = '';
-            next;
-        }
-        if ($line =~ /^\s*dummy.*\s+Link/) {
-            $intf_name = '';
-            next;
-        }
-        if ($line =~ /^(\S+)\s+Link/) {
-            $intf_name = $1;
-            next;
-        }
-        if ($intf_name and
-                $line =~ /^\s+inet\s+.*?:($ip_re).*:($ip_re)/) {
-            my $ip = $1;
-            my $mask = $2;
 
-            my @ipbytes = split /\./, $ip;
-            my @mbytes  = split /\./, $mask;
-
-            my $netaddr = '';
-            for (my $i=0; $i < 4; $i++) {
-                my $byte1 = $mbytes[$i]+0;
-                my $byte2 = $ipbytes[$i]+0;
-                my $netaddr_byte = $byte1 & $byte2;
-                if ($i != 0) {
-                    $netaddr = $netaddr . '.' . $netaddr_byte;
-                } else {
-                    $netaddr = $netaddr_byte;
-                }
+    if ($config{'IFCFGTYPE'} =~ /iproute2/i) {
+        my @ip_out = `$cmds{'ip'} addr`;
+        for my $line (@ip_out) {
+            if ($line =~ /^\d+:\s+(\S+): </) {
+                $intf_name = $1;
+                next;
             }
+            if ($line =~ /^\s+inet\s+(\S+)\/(\d+)/) {
+                my $ip = $1;
+                my $mask = $2;
 
-            $connected_subnets{$intf_name} = "$netaddr/$mask";
-            $net_ctr++;
+                my $netaddr = &get_netaddr($ip, $mask);
+
+                $connected_subnets{$intf_name} = "$netaddr/$mask";
+                $net_ctr++;
+            }
+        }
+    } else {
+        my @ifconfig_out = `$cmds{'ifconfig'} -a`;
+        for my $line (@ifconfig_out) {
+            if ($line =~ /^\s*lo\s+Link/) {
+                $intf_name = '';
+                next;
+            }
+            if ($line =~ /^\s*dummy.*\s+Link/) {
+                $intf_name = '';
+                next;
+            }
+            if ($line =~ /^(\S+)\s+Link/) {
+                $intf_name = $1;
+                next;
+            }
+            if ($intf_name and
+                    $line =~ /^\s+inet\s+.*?:($ip_re).*:($ip_re)/) {
+                my $ip = $1;
+                my $mask = $2;
+
+                my $netaddr = &get_netaddr($ip, $mask);
+
+                $connected_subnets{$intf_name} = "$netaddr/$mask";
+                $net_ctr++;
+            }
         }
     }
     ### found two or more subnets, so forwarding traffic becomes
@@ -1226,11 +1236,11 @@ sub set_home_net() {
     }
     my $ans_file_str = 'Specify HOME_NET subnets:';
     my $str =
-"\n    Specify which subnets are part of your internal network.  Note that\n" .
+"\n    Specify which subnets are part of your internal network. Note that\n" .
 "    you can correct anything you enter here by editing the \"HOME_NET\"\n" .
 "    variable in: $file.\n\n" .
 "    Enter each of the subnets (except for the external subnet) on a line by\n" .
-"    itself.  Each of the subnets should be in the form <net>/<mask>.  E.g.\n" .
+"    itself. Each of the subnets should be in the form <net>/<mask>. E.g.\n" .
 "    in CIDR notation: 192.168.10.0/24 (preferrable), or regular notation:\n" .
 "    192.168.10.0/255.255.255.0\n\n    End with a \".\" on a line by itself.\n\n";
     &logr($str);
@@ -1272,38 +1282,14 @@ sub query_signatures() {
 
 sub download_signatures() {
 
-    my $curr_pwd = cwd() or die $!;
-    chdir '/tmp' or die $!;
-
-    print "[+] Downloading latest signatures from:\n",
-        "        $config{'SIG_UPDATE_URL'}\n";
-
-    unlink 'signatures' if -e 'signatures';
-
-    ### download the file
-    unless (-x $wgetCmd) {
-        &logr("[-] The $wgetCmd var is not a valid path for wget, " .
-            "skipping sig install.\n");
-    }
-    &run_cmd("$wgetCmd $config{'SIG_UPDATE_URL'}");
-
-    unless (-e 'signatures') {
-        &logr("[-] Could not download signatures, continuing with install.\n");
-    }
-
-    unlink "$config{'PSAD_CONF_DIR'}/signatures"
-        if -e "$config{'PSAD_CONF_DIR'}/signatures";
-    move 'signatures', "$config{'PSAD_CONF_DIR'}/signatures";
-    chdir $curr_pwd or die $!;
-
-    return;
+    &run_cmd("${USRSBIN_DIR}/psad --sig-update");
 }
 
 sub query_use_home_net_default() {
     my $str =
 "\n[+] By default, psad matches Snort rules against any IP addresses, but\n" .
 "    psad offers the ability to restrict signature matches to specific\n" .
-"    networks with the HOME_NET variable (similar to Snort).  However, psad\n" .
+"    networks with the HOME_NET variable (similar to Snort). However, psad\n" .
 "    also offers the ability to acquire all local subnets on the local system\n" .
 "    by parsing the output of \"ifconfig\", or the subnets can be restricted\n" .
 "    to a limited set of networks.\n\n";
@@ -1356,7 +1342,7 @@ sub check_hostname() {
             ### only the HOSTNAME variable is set to _CHANGEME_ by
             ### default as of psad-1.6.0
             if ($var eq 'HOSTNAME') {
-                &logr("[-] set_hostname() failed.  Edit the HOSTNAME " .
+                &logr("[-] set_hostname() failed. Edit the HOSTNAME " .
                     " variable in $file\n");
             } else {
                 &logr("[-] Var $var is set to _CHANGEME_ in " .
@@ -1616,156 +1602,6 @@ sub append_fifo_syslog() {
     return;
 }
 
-sub test_syslog_config() {
-    my $syslog_str = shift;
-    my %used_ports;
-
-    ### first find an unused high tcp port to use for testing
-    my @netstat_out = `$cmds{'netstat'} -an`;
-
-    for my $line (@netstat_out) {
-        chomp $line;
-        if ($line =~ m/^\s*tcp\s+\d+\s+\d+\s+\S+:(\d+)\s/) {
-            ### $1 == protocol (tcp/udp), $2 == port number
-            $used_ports{$1} = '';
-        }
-    }
-
-    ### get the first unused high tcp port greater than 5000
-    my $test_port = 5000;
-    $test_port++ while defined $used_ports{$test_port};
-
-    ### make sure the interface is actually up
-    unless (&run_cmd("$cmds{'ifconfig'} lo up")) {
-        &logr("[-] Could not bring up the loopback interface.\n" .
-            "    Hoping the syslog reconfig will work anyway.\n");
-        return 0;
-    }
-
-    ### make sure we can see the loopback interface with
-    ### ifconfig
-    my @if_out = `$cmds{'ifconfig'} lo`;
-
-    unless (@if_out) {
-        &logr("[-] Could not see the loopback interface with ifconfig.  " .
-            "Hoping\n    syslog reconfig will work anyway.\n");
-        return 0;
-    }
-
-    my $lo_ip = '127.0.0.1';
-    my $found_ip = 0;
-    for my $line (@if_out) {
-        if ($line =~ /inet\s+addr:($ip_re)\s/) {
-            $lo_ip = $1;  ### this should always be 127.0.0.1
-            &logr("[-] loopback interface IP is not 127.0.0.1.  Continuing ".
-                "anyway.\n") unless $lo_ip eq '127.0.0.1';
-            $found_ip = 1;
-        }
-    }
-
-    unless ($found_ip) {
-        &logr("[-] The loopback interface does not have an IP.\n" .
-            "    Hoping the syslog reconfig will work anyway.\n");
-        return 0;
-    }
-
-    ### remove any "test_DROP" lines from fwdata file and ipt_prefix_ctr
-    ### before seeing if new ones can be written
-    &scrub_prefix_ctr();
-
-    my $start_kmsgsd = 1;
-    if (-e $config{'KMSGSD_PID_FILE'}) {
-        open PID, "< $config{'KMSGSD_PID_FILE'}" or die "[*] Could not open ",
-            "$config{'KMSGSD_PID_FILE'}: $!";
-        my $pid = <PID>;
-        close PID;
-        chomp $pid;
-        if (kill 0, $pid) {  ### kmsgsd is already running
-            $start_kmsgsd = 0;
-        }
-    }
-    if ($start_kmsgsd) {
-        ### briefly start kmsgsd just long enough to test syslog
-        ### with a packet to port 5000 (or higher).
-        unless (&run_cmd("${USRSBIN_DIR}/kmsgsd") == 0) {
-            &logr("[-] Could not start kmsgsd to test syslog.\n" .
-                "    Send email to Michael Rash (mbr\@cipherdyne.org)\n");
-            return 0;
-        }
-    }
-
-    ### insert a rule to deny traffic to the loopback
-    ### interface on $test_port
-    &run_cmd("$cmds{'iptables'} -I INPUT 1 -i lo -p tcp --dport " .
-        "$test_port -j LOG --log-prefix \"test_DROP \"");
-
-    open FWDATA, "$config{'FW_DATA_FILE'}" or
-        die "[*] Could not open $config{'FW_DATA_FILE'}: $!";
-
-    seek FWDATA,0,2;  ### seek to the end of the file
-
-    ### try to connect to $test_port to generate an iptables
-    ### drop message.  Note that since nothing is listening on
-    ### the port we will immediately receive a tcp reset.
-    my $sock = new IO::Socket::INET(
-        'PeerAddr' => $lo_ip,
-        'PeerPort' => $test_port,
-        'Proto'    => 'tcp',
-        'Timeout'  => 1
-    );
-    undef $sock if defined $sock;
-
-    ### sleep to give kmsgsd a chance to pick up the packet
-    ### log message from syslog
-    sleep 2;
-
-    my $found = 0;
-
-    my @pkts = <FWDATA>;
-    close FWDATA;
-    for my $pkt (@pkts) {
-        $found = 1 if $pkt =~ /test_DROP/;
-    }
-
-    ### remove the testing firewall rule
-    &run_cmd("$cmds{'iptables'} -D INPUT 1");
-
-    ### remove the any new test_DROP lines we just created
-    ### (this probably is not necessary because psad is not
-    ### running).
-    &scrub_prefix_ctr();
-
-    if ($found) {
-    } else {
-    }
-
-    if ($start_kmsgsd && -e $config{'KMSGSD_PID_FILE'}) {
-        open PID, "$config{'KMSGSD_PID_FILE'}" or return 0;
-        my $pid = <PID>;
-        close PID;
-        chomp $pid;
-        kill 9, $pid if kill 0, $pid;
-    }
-    return $found;
-}
-
-sub scrub_prefix_ctr() {
-    if (-e $config{'IPT_PREFIX_COUNTER_FILE'}) {
-        open SCRUB, "< $config{'IPT_PREFIX_COUNTER_FILE'}" or
-            die "[*] Could not open $config{'IPT_PREFIX_COUNTER_FILE'}: $!";
-        my @lines = <SCRUB>;
-        close SCRUB;
-
-        open SCRUB, "> $config{'IPT_PREFIX_COUNTER_FILE'}" or
-            die "[*] Could not open $config{'IPT_PREFIX_COUNTER_FILE'}: $!";
-        for my $line (@lines) {
-            print SCRUB $line unless $line =~ /test_DROP/;
-        }
-        close SCRUB;
-    }
-    return;
-}
-
 sub check_old_psad_installation() {
 
     return unless &is_root();
@@ -1854,11 +1690,11 @@ sub get_fw_search_strings() {
     my $str =
 "\n    psad checks the firewall configuration on the underlying machine\n" .
 "    to see if packets will be logged and dropped that have not\n" .
-"    explicitly allowed through.  By default, psad looks for the string\n" .
+"    explicitly allowed through. By default, psad looks for the string\n" .
 "    \"DROP\". However, if your particular firewall configuration logs\n" .
 "    blocked packets with the string \"Audit\" for example, psad can be\n" .
-"    configured here to look for this string.  In addition, psad can also\n" .
-"    be configured here to look for multiple strings if needed.  Remember,\n" .
+"    configured here to look for this string. In addition, psad can also\n" .
+"    be configured here to look for multiple strings if needed. Remember,\n" .
 "    whatever string you configure psad to look for must be logged via the\n" .
 "    --log-prefix option in iptables.\n\n";
         &logr($str);
@@ -1901,10 +1737,10 @@ sub get_fw_search_strings() {
 sub query_dshield() {
     my $str =
 "\n[+] psad has the capability of sending scan data via email alerts to the\n" .
-"    DShield distributed intrusion detection system (www.dshield.org).  By\n" .
+"    DShield distributed intrusion detection system (www.dshield.org). By\n" .
 "    default this feature is not enabled since firewall log data is sensitive,\n" .
 "    but submitting logs to DShield provides a valuable service and assists\n" .
-"    in generally enhancing internet security.  As an optional step, if you\n" .
+"    in generally enhancing internet security. As an optional step, if you\n" .
 "    have a DShield user id you can edit the \"DSHIELD_USER_ID\" variable\n" .
 "    in $config{'PSAD_CONF_DIR'}/psad.conf\n\n";
     &logr($str);
@@ -1967,7 +1803,7 @@ sub query_email() {
 
 sub query_syslog() {
     &logr("\n[+] psad supports the syslogd, rsyslogd, syslog-ng, ulogd, and\n" .
-        "    metalog logging daemons.  Which system logger is running?\n\n");
+        "    metalog logging daemons. Which system logger is running?\n\n");
 
     my $ans = '';
     my $ans_file_str = 'System logger:';
@@ -2074,6 +1910,12 @@ sub archive() {
     my $file = shift;
     my $curr_pwd = cwd() or die $!;
     chdir $config{'CONF_ARCHIVE_DIR'} or die $!;
+
+    unless (-e $file) {
+        &logr("[-] File '$file' does not exist in $config{'CONF_ARCHIVE_DIR'}\n");
+        return;
+    }
+
     my ($filename) = ($file =~ m|.*/(.*)|);
     my $base = "${filename}.old";
     for (my $i = 5; $i > 1; $i--) {  ### keep five copies of old config files
